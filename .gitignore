@@ -1,0 +1,21 @@
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.DS_Store
+.vscode/
+
+# Runtime outputs; the bundled example run results are tracked, except the
+# large FitResult chunk, which running the example regenerates
+results/*
+!results/fitting/
+results/fitting/*
+!results/fitting/example_run/
+results/fitting/example_run/data/chunks/
+logs/
+
+# Downloaded raw data and preprocessing outputs
+/data/
+*.tmp
+
+# Local maintainer tools
+tools/

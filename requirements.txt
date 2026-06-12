@@ -1,0 +1,24 @@
+# Versions are pinned to the environment used to produce the published
+# results and the bundled example outputs. Python 3.10 is required.
+
+# Core (fitting on preprocessed data)
+numpy==1.24.4
+scipy==1.13.1
+pandas==2.1.1
+h5py==3.13.0
+matplotlib==3.10.3
+lmfit==1.2.2
+joblib==1.5.0
+tqdm==4.66.1
+num2tex==0.8
+
+# Preprocessing from raw Solar Orbiter CDF files
+astropy==5.3.4
+xarray==2023.10.1
+cdasws==1.7.43
+requests==2.32.3
+beautifulsoup4==4.13.4
+
+# Optional: automatic L1 count download from SOAR
+sunpy==5.0.1
+sunpy-soar==1.10
