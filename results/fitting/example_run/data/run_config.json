@@ -1,0 +1,22 @@
+{
+  "run_name": "example_run",
+  "pickle_dir": "examples/example_data",
+  "pickle_file_path": [
+    "VDF_eas_forFitting_20220302121509_20220302122509_1min.h5"
+  ],
+  "break_E_dir": "examples/example_data",
+  "break_E_files": [
+    "VDF_eas_forFitting_20220302121509_20220302122509_1min_cone_feature_split.pkl"
+  ],
+  "energy_delta_file": "examples/example_data/energy_deltas.npz",
+  "fit_beg": null,
+  "fit_end": null,
+  "n_jobs": 4,
+  "overwrite_existing_chunks": false,
+  "cond_final_plot": true,
+  "low_pad_val": 61,
+  "high_pad_val": 1000,
+  "beam_ratio_cond": 1.2,
+  "deficit_ratio_cond": 0.5,
+  "low_c_val": 14
+}
