@@ -11,11 +11,22 @@ results/*
 results/fitting/*
 !results/fitting/example_run/
 results/fitting/example_run/data/chunks/
+!results/fitting/example_run_poisson/
+!results/fitting/example_days_2023-04-04_05/
+results/fitting/example_days_2023-04-04_05/plots/
+results/fitting/example_days_2023-04-04_05/per_file/
+results/fitting/example_days_2023-04-04_05/video/
 logs/
 
-# Downloaded raw data and preprocessing outputs
+# Downloaded raw data, preprocessing outputs and release staging
 /data/
+/release/
+workshop/html/
 *.tmp
 
-# Local maintainer tools
-tools/
+# Maintainer tools: only the notebook sources and the example-subset cutter ship
+tools/*
+!tools/build_notebooks.py
+!tools/notebook_builder.py
+!tools/make_example_subset.py
+!tools/write_saturation_census.py
