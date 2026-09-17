@@ -5,9 +5,12 @@ from astropy import constants as const
 from astropy import units as u
 from math import floor, log10
 import re
+# import dask.array as da
 import pickle
 import os
-from pathlib import Path
+import sys
+import time
+import requests
 import h5py
 import matplotlib.pyplot as plt
 from matplotlib.dates import DateFormatter
@@ -15,11 +18,25 @@ from matplotlib.dates import DateFormatter
 from cdasws import CdasWs
 from cdasws.datarepresentation import DataRepresentation as dr
 from download_EAS_Data import download_eas_data
+from download_L2_PSD_from_SOAR import (
+    discoverLocalL1Count,
+    discoverLocalL2Psd,
+    downloadSoL1CountNm3d,
+    downloadSoL2PsdNm3d,
+    findUncoveredIntervals,
+)
 
+from pathlib import Path
+
+# Repository-relative defaults. No chdir: importing this module must not change
+# the caller's working directory (notebooks, runner subprocesses).
 REPO_ROOT = Path(__file__).resolve().parents[1]
-# EAS geometric factors / quantum efficiencies, used to convert L1 counts
-# to VDF and its uncertainty; shipped alongside the example data.
 CALIBRATION_DIR = REPO_ROOT / 'examples' / 'example_data'
+
+# EAS L1 counter blocks that carry the VALIDMAX sentinel are telemetry fill, not
+# measurements (whole 4-azimuth packet groups at one energy step). They are dropped
+# from counts and PSD before anything is derived from them.
+COUNT_SATURATION_VALUE = 65535
 
 # --- Geometric Factor & Quantum Efficiency ---
 def load_geometric_factors(instrument, count_data):
@@ -63,11 +80,11 @@ def load_quantum_efficiency(instrument, count_data):
     # Get energy value
     if energy_coord in count_data.coords:
         energy_values = count_data.coords[energy_coord]
-        # use only the first time step's energies if time-dependent
+        # 检查是否需要只取第一个时间点的能量值
         if 'EPOCH' in energy_values.dims and len(energy_values.dims) > 1:
             energy_values = energy_values.isel(EPOCH=0)
     else:
-        # fall back to the dimension itself if the energy coordinate is missing
+        # 如果找不到能量坐标，尝试使用维度本身
         energy_values = count_data[energy_dim] if energy_dim in count_data else None
     if energy_values is None:
         raise ValueError(f"Energy coordinate {energy_coord} not found in count_data")
@@ -207,13 +224,13 @@ def get_EAS_energy(dataset, instrument = None):
     energy_var = f'SWA_{instrument}_ENERGY'
     
     if energy_var not in dataset.variables:
-        raise ValueError(f"Variable {energy_var} not found in dataset")
+        raise ValueError(f"数据集中不存在 {energy_var} 变量")
     
     energy_data = dataset[energy_var]
-    # check the structure of the energy data
+    # 检查能量数据的结构
     if 'EPOCH' in energy_data.dims:
-        # older versions: energy data includes an EPOCH dimension
-        # take the energy values at the first time step
+        # 旧版本: 能量数据包含EPOCH维度
+        # 提取第一个时间点的能量数据
         energy_data = energy_data.isel(EPOCH=10)
     return energy_data
 
@@ -470,6 +487,28 @@ def align_eas_datasets(psdEAS1, psdEAS2, countEAS1, countEAS2, timeRange=None):
     }
 
 # Remove SC Potential
+def getCdasDataWithRetry(cdas, dataset, variables, startStr, endStr,
+                         maxRetries=4, retryDelaySeconds=5):
+    """cdas.get_data with retry on transient CDAS connection failures.
+
+    CDAS occasionally drops the connection mid-download (RemoteDisconnected /
+    ConnectionError), which would otherwise abort a multi-interval run after
+    hours of work. Retry a few times with a short delay, then re-raise. Returns
+    the data object (the [1] element of get_data); a genuine no-data response
+    still returns None without retrying.
+    """
+    for attempt in range(1, maxRetries + 1):
+        try:
+            return cdas.get_data(dataset, variables, startStr, endStr,
+                                 dataRepresentation=dr.XARRAY)[1]
+        except requests.exceptions.RequestException as error:
+            if attempt == maxRetries:
+                print(f"  CDAS {dataset} download failed after {maxRetries} attempts: {error}")
+                raise
+            print(f"  CDAS {dataset} attempt {attempt}/{maxRetries} failed "
+                  f"({error}); retrying in {retryDelaySeconds}s...")
+            time.sleep(retryDelaySeconds)
+
 def get_RPW_SCPOT(timeRange):
     # Get the magnetic field data from CDAWeb
     cdas = CdasWs()
@@ -480,10 +519,38 @@ def get_RPW_SCPOT(timeRange):
     ]
 
     # Get the magnetic field data
-    rpw_data = cdas.get_data('SOLO_L3_RPW-BIA-SCPOT-10-SECONDS',['SCPOT'],timeRange_str[0],timeRange_str[1],dataRepresentation = dr.XARRAY)[1]
+    rpw_data = getCdasDataWithRetry(cdas, 'SOLO_L3_RPW-BIA-SCPOT-10-SECONDS', ['SCPOT'], timeRange_str[0], timeRange_str[1])
     # Altervative: SOLO_L3_RPW-BIA-SCPOT-10-SECONDS
 
     return rpw_data
+
+def load_scpot_from_csv(scpot_file):
+    """Load a user-estimated SCPOT time series (columns: time, scpotV) as a DataArray.
+
+    Drop-in replacement for the RPW 'SCPOT' variable when SOAR/CDAS has no
+    spacecraft potential for the period (RPW SCPOT ends 2023-01-01). The CSV
+    format is what estimate_scpot_oct2022_20s writes.
+    """
+    scpot_table = pd.read_csv(scpot_file, parse_dates=['time'])
+    valid_rows = scpot_table[scpot_table['scpotV'].notna()]
+    print(f"Loaded {len(valid_rows)}/{len(scpot_table)} valid SCPOT samples from {scpot_file}")
+    return xr.DataArray(
+        valid_rows['scpotV'].to_numpy(),
+        coords={'Epoch': valid_rows['time'].to_numpy()},
+        dims=['Epoch'],
+        name='SCPOT',
+    )
+
+def nearest_valid_scpot(scpot_series, target_time):
+    """Nearest finite SCPOT value in time from the fetched series; NaN if none."""
+    values = np.asarray(scpot_series.values, dtype=float)
+    valid = np.isfinite(values)
+    if not valid.any():
+        return np.nan
+    times = pd.to_datetime(scpot_series['Epoch'].values)[valid]
+    deltas = np.abs((times - pd.Timestamp(target_time)).total_seconds())
+    return float(values[valid][int(np.argmin(deltas))])
+
 
 def align_rpw_to_eas(rpw_data, eas_epoch, rpw_time_coord='Epoch'):
     from scipy.interpolate import PchipInterpolator
@@ -569,7 +636,7 @@ def get_SO_MAG_SRF_Normal(timeRange):
     ]
 
     # Get the magnetic field data
-    MAG_data = cdas.get_data('SOLO_L2_MAG-SRF-NORMAL',['B_SRF'],timeRange_str[0],timeRange_str[1],dataRepresentation = dr.XARRAY)[1]
+    MAG_data = getCdasDataWithRetry(cdas, 'SOLO_L2_MAG-SRF-NORMAL', ['B_SRF'], timeRange_str[0], timeRange_str[1])
 
     return MAG_data
 
@@ -599,7 +666,7 @@ def get_SO_PAS_Grnd_Moment(timeRange):
     ]
 
     # Get the magnetic field data
-    PAS_data = cdas.get_data('SOLO_L2_SWA-PAS-GRND-MOM',['V_SRF','N'],timeRange_str[0],timeRange_str[1],dataRepresentation = dr.XARRAY)[1]
+    PAS_data = getCdasDataWithRetry(cdas, 'SOLO_L2_SWA-PAS-GRND-MOM', ['V_SRF','N'], timeRange_str[0], timeRange_str[1])
 
     return PAS_data
 
@@ -643,7 +710,7 @@ def get_SO_RPW_Density(timeRange):
     ]
 
     # Get the magnetic field data
-    rpw_data = cdas.get_data('SOLO_L3_RPW-BIA-DENSITY',['DENSITY'],timeRange_str[0],timeRange_str[1],dataRepresentation = dr.XARRAY)[1]
+    rpw_data = getCdasDataWithRetry(cdas, 'SOLO_L3_RPW-BIA-DENSITY', ['DENSITY'], timeRange_str[0], timeRange_str[1])
 
     return rpw_data
 
@@ -663,146 +730,34 @@ def average_RPWDensity_around_timeStamp(rpwArray, EAS_epoch, timeFreq = None):
         rpwDensity = np.array([rpwArray.sel(Epoch=slice(t-pd.Timedelta(seconds=0.5), t+pd.Timedelta(seconds=0.5))).mean(dim='Epoch').values for t in timeSlice])
     return rpwDensity
 
-## Download EAS L1 Count data
-def download_SO_L1_Count_NM3D(timeRange, downloadDir=None):
-    # Get the L1 data from SOAR
-    from sunpy.net import Fido, attrs as a
-    import sunpy_soar
+## Locate EAS L1 Count data
+def resolveCountFiles(timeRange, downloadDir, preferLocal=False):
+    """Return the (EAS1, EAS2) L1 count file paths covering timeRange.
 
-    if downloadDir is None:
-        downloadDir = REPO_ROOT / 'data' / 'L1_Count'
-    downloadPath = str(downloadDir)
+    The counts carry the Poisson uncertainty of the L2 PSD, so a set that covers
+    only part of the window silently truncates the run: align_eas_datasets keeps
+    the intersection of the PSD and count epochs. Local files are therefore only
+    accepted when they cover the whole range; otherwise SOAR fills the holes
+    (already-downloaded files are not fetched again).
 
-    # Ensure the directory exists
-    if not os.path.exists(downloadPath):
-        os.makedirs(downloadPath)
+    Version and boundary handling is shared with the L2 PSD path, so the shifted
+    republished windows that used to slip through as duplicates are dropped here
+    too.
+    """
+    if preferLocal:
+        eas1CountFiles, eas2CountFiles = discoverLocalL1Count(timeRange, downloadDir=downloadDir)
+        missingIntervals = (findUncoveredIntervals(timeRange, eas1CountFiles)
+                            + findUncoveredIntervals(timeRange, eas2CountFiles))
+        if eas1CountFiles and eas2CountFiles and not missingIntervals:
+            return eas1CountFiles, eas2CountFiles
 
-    def adjust_timeRange(timeRange, min_hours=6):
-        # Ensure at least 1 file can be located
-        # Calculate the time difference
-        start_dt = pd.to_datetime(timeRange[0])
-        end_dt = pd.to_datetime(timeRange[-1])
-        time_diff = end_dt - start_dt
-        
-        # Check if the time range is less than the minimum required duration
-        if time_diff < pd.Timedelta(hours=min_hours):
-            # Calculate how much time to add on each side to reach the minimum range
-            additional_time = (pd.Timedelta(hours=min_hours) - time_diff) / 2
-            start_dt = pd.to_datetime(timeRange[0]) - additional_time
-            end_dt = pd.to_datetime(timeRange[-1]) + additional_time
-        
-        # Convert adjusted datetime back to string format
-        adjusted_start = start_dt.strftime('%Y-%m-%d %H:%M')
-        adjusted_end = end_dt.strftime('%Y-%m-%d %H:%M')
-        return adjusted_start, adjusted_end
-    
-    def select_latest_version(results):
-        from copy import deepcopy
-        import re
-        
-        # Check if 'soar' provider exists in the results
-        if 'soar' not in results.keys():
-            print("No SOAR results found, returning original results")
-            return results
-        
-        # Access the filenames directly from results['soar']['Filename']
-        file_info = []
-        
-        # KEEP THE ORIGINAL CODE AS IS FOR EXTRACTING file_info
-        for idx, filename in enumerate(results['soar']['Filename']):
-            filename_str = str(filename)
-            
-            # Extract time period from filename
-            time_match = re.search(r'(\d{8}T\d{6}-\d{8}T\d{6})', filename_str)
-            if not time_match:
-                continue
-                    
-            time_period = time_match.group(1)
-            
-            # Extract version from filename
-            version_match = re.search(r'V(\d+)\.cdf$', filename_str)
-            if not version_match:
-                continue
-                
-            version = int(version_match.group(1))
-            
-            file_info.append({
-                'index': idx,
-                'time_period': time_period,
-                'version': version,
-                'filename': filename_str
-            })
-        
-        # Extract start and end hour from each time period
-        hour_groups = {}
-        
-        for info in file_info:
-            # Parse the time_period to extract hour information
-            # Format: YYYYMMDDTHHMMSS-YYYYMMDDTHHMMSS
-            period_match = re.search(r'(\d{8}T\d{2})\d{4}-(\d{8}T\d{2})\d{4}', info['time_period'])
-            if not period_match:
-                continue
-                
-            # Extract hour-precision time parts
-            start_hour = period_match.group(1)  # YYYYMMDDTHH
-            end_hour = period_match.group(2)    # YYYYMMDDTHH
-            
-            # Create hour-precision key
-            hour_key = f"{start_hour}-{end_hour}"
-            
-            if hour_key not in hour_groups:
-                hour_groups[hour_key] = []
-                
-            hour_groups[hour_key].append(info)
-        
-        # For each hour-precision group, select only the file with the highest version
-        indices_to_keep = []
-        
-        for hour_key, group_files in hour_groups.items():
-            # Filter to keep only V01 files
-            v01_files = [file for file in group_files if file['version'] == 1]
-            
-            if v01_files:
-                # If V01 files exist for this hour group, use them
-                for v01_file in v01_files:
-                    indices_to_keep.append(v01_file['index'])
-                    print(f"For hour period {hour_key}, selecting V01 file: {v01_file['filename']}")
-            else:
-                # If no V01 files, print a warning and skip this hour group
-                print(f"Warning: No V01 files found for hour period {hour_key}. Available versions: {[f['version'] for f in group_files]}")
-                print("Skipping this hour period.")
-        
-        # Keep only the selected files from the SOAR provider
-        if indices_to_keep:
-            # Sort indices to maintain original order
-            indices_to_keep.sort()
-            filtered = results['soar'][indices_to_keep]
-        else:
-            print("No V01 files found for any hour period. Returning empty results.")
-            filtered = results['soar'][0:0]  # Empty subset
-        
-        original_count = len(results['soar'])
-        kept_count = len(filtered)
-        print(f"Found {len(hour_groups)} unique hour-precision time periods")
-        print(f"Filtered {original_count} files to {kept_count} V01 files")
-        
-        return filtered
+        for intervalStart, intervalEnd in missingIntervals:
+            print(f"  Local L1 counts miss {intervalStart} to {intervalEnd}")
+        print("Local L1 count files do not cover the requested range; querying SOAR "
+              "(files already on disk are not re-downloaded).")
 
-    adjust_timeRange = adjust_timeRange(timeRange)
-    result_eas1 = Fido.search(a.Instrument('SWA') , a.Time(adjust_timeRange[0],adjust_timeRange[-1]) , a.Level(1) , a.soar.Product('swa-eas1-nm3d'))
-    result_eas2 = Fido.search(a.Instrument('SWA') , a.Time(adjust_timeRange[0],adjust_timeRange[-1]) , a.Level(1) , a.soar.Product('swa-eas2-nm3d'))
+    return downloadSoL1CountNm3d(timeRange, downloadDir=downloadDir)
 
-    # Select the latest version if multiple versions exist
-    result_eas1 = select_latest_version(result_eas1)
-    result_eas2 = select_latest_version(result_eas2)
-
-    print(f"Found {len(result_eas1)} EAS1 files and {len(result_eas2)} EAS2 files")
-    
-    # Download
-    countEAS1_files = Fido.fetch(result_eas1, path=os.path.join(downloadPath, '{file}'))
-    countEAS2_files = Fido.fetch(result_eas2, path=os.path.join(downloadPath, '{file}')) # downloadPath
-    
-    return countEAS1_files, countEAS2_files
 
 # Data Processing
 ## Calculate the pitch angle in SRF
@@ -997,6 +952,11 @@ def getPsdPitchAngleEnergy(psdArray, uncArray, pitchAngIdx, pitchAngle):
                 psdSelect_eas2 = psd2_slice[PA_dataIdx_eas2]
                 psd_selection = np.concatenate([psdSelect_eas1, psdSelect_eas2])
                 unc_selection = np.concatenate([unc_sliceEas1[PA_dataIdx_eas1], unc_sliceEas2[PA_dataIdx_eas2]])
+                # Masked pixels (L2 fill value, L1 saturation blocks) carry NaN and must
+                # not turn the whole bin into NaN.
+                finiteSelection = np.isfinite(psd_selection)
+                psd_selection = psd_selection[finiteSelection]
+                unc_selection = unc_selection[finiteSelection]
 
                 # Incorrect. Calculate the uncertainty of the mean PSD: taking the unc of each pixels (psd, count) and number of pixels (N) into account
                 # nonZeroMask = count_selection > 0
@@ -1099,10 +1059,34 @@ def save_data_toHDF5(data, filePath, compression='gzip', compression_opts=4):
     print(f"Data saved to {filePath}\n")
 
 
-def process_eas_data(eas1Files, eas2Files, countEAS1_files=None, countEAS2_files=None, download_dir=None, output_dir=None, timeRes='1min', custom_timeRange=None, shift_SCPOT=False):
-    
+def maskSaturatedCounts(countArray, psdArray, sensorName):
+    """Set counts and PSD to NaN wherever the L1 counter holds the saturation
+    sentinel (>= COUNT_SATURATION_VALUE). Returns the masked arrays and the number
+    of masked pixels per epoch (zeros when nothing was masked)."""
+    saturated = np.asarray(countArray.values) >= COUNT_SATURATION_VALUE
+    saturatedPerEpoch = saturated.reshape(saturated.shape[0], -1).sum(axis=1)
+    if not saturated.any():
+        return countArray, psdArray, saturatedPerEpoch
+    if saturated.shape != psdArray.shape:
+        raise ValueError(f"{sensorName}: count shape {saturated.shape} differs from PSD shape {psdArray.shape}")
+    affectedEpochs = int((saturatedPerEpoch > 0).sum())
+    print(f"{sensorName}: masking {int(saturated.sum())} saturated count pixels "
+          f"(>= {COUNT_SATURATION_VALUE}) in {affectedEpochs}/{len(saturatedPerEpoch)} epochs")
+    countValues = np.asarray(countArray.values, dtype=float).copy()
+    countValues[saturated] = np.nan
+    psdValues = np.asarray(psdArray.values, dtype=float).copy()
+    psdValues[saturated] = np.nan
+    return countArray.copy(data=countValues), psdArray.copy(data=psdValues), saturatedPerEpoch
+
+
+def process_eas_data(eas1Files, eas2Files, countEAS1_files=None, countEAS2_files=None, download_dir=None, output_dir=None, timeRes='1min', custom_timeRange=None, shift_SCPOT=False, scpot_file=None, allowMissingMag=False, psd_source='soar'):
+
     if output_dir is None:
         output_dir = str(REPO_ROOT / 'data' / 'processed')
+
+    if scpot_file is not None and not shift_SCPOT:
+        print('scpot_file provided: enabling shift_SCPOT with the supplied potential table.')
+        shift_SCPOT = True
 
 
     # Read and concatenate the DataArrays
@@ -1129,11 +1113,18 @@ def process_eas_data(eas1Files, eas2Files, countEAS1_files=None, countEAS2_files
 
     vEAS1 = convert_eV_2Velocity(energyEAS1.values) 
     vEAS2 = convert_eV_2Velocity(energyEAS2.values) 
-    # RPW data
-    print('Getting RPW SCPOT data...')
-    t_rpw_start = pd.Timestamp(psdEAS1['EPOCH'].values[0])-pd.Timedelta(seconds=30)
-    t_rpw_end = pd.Timestamp(psdEAS1['EPOCH'].values[-1])+pd.Timedelta(seconds=30)
-    rpw_data = get_RPW_SCPOT([t_rpw_start, t_rpw_end])
+    # Spacecraft potential source: a user-supplied table (scpot_file) takes priority
+    # over the CDAWeb fetch. The CDAWeb 10-second RPW SCPOT product ends 2023-01-01;
+    # for later windows build the table from the SOAR L3 daily files with
+    # build_scpot_table_from_soar_l3.py and pass it as scpot_file.
+    scpot_series = None
+    if scpot_file is not None:
+        scpot_series = load_scpot_from_csv(scpot_file)
+    elif shift_SCPOT:
+        print('Getting RPW SCPOT data...')
+        t_rpw_start = pd.Timestamp(psdEAS1['EPOCH'].values[0])-pd.Timedelta(seconds=30)
+        t_rpw_end = pd.Timestamp(psdEAS1['EPOCH'].values[-1])+pd.Timedelta(seconds=30)
+        scpot_series = get_RPW_SCPOT([t_rpw_start, t_rpw_end])['SCPOT']
 
     # Transfer To Spacecraft Frame
     eas1_toSRF = datasetEAS1[0]['EAS1_TO_SRF'].values.copy()
@@ -1154,12 +1145,15 @@ def process_eas_data(eas1Files, eas2Files, countEAS1_files=None, countEAS2_files
         print(f"Using provided custom time range: {timeRange_EAS[0]} to {timeRange_EAS[1]}")
 
 
-    # Process count data - download if not provided
+    # Process count data - locate it from the PSD time range if not provided
     if countEAS1_files is None or countEAS2_files is None:
-        print(f"\nDownloading count data for time range {timeRange_EAS[0]} to {timeRange_EAS[1]}")
-        countEAS1_files,countEAS2_files = download_SO_L1_Count_NM3D(timeRange_EAS, downloadDir = os.path.join(download_dir, 'L1_Count'))
-        
-        
+        print(f"\nLocating count data for time range {timeRange_EAS[0]} to {timeRange_EAS[1]}")
+        countEAS1_files, countEAS2_files = resolveCountFiles(
+            timeRange_EAS,
+            downloadDir=os.path.join(download_dir, 'L1_Count'),
+            preferLocal=(psd_source == 'local'))
+
+
     print('Reading EAS1 count data...')
     countEAS1,count_datasetEAS1 = readCDFs(countEAS1_files, skip_errors=True) #
     print('Reading EAS2 count data...')
@@ -1195,8 +1189,34 @@ def process_eas_data(eas1Files, eas2Files, countEAS1_files=None, countEAS2_files
     processed_file_paths = []
     for id, timeRange in enumerate(time_ranges[0:]):
         print(f"\nProcessing interval {id+1}/{len(time_ranges)}: {timeRange[0]} to {timeRange[1]}")
-        
-        # Extract desired period of EAS PSD 
+
+        # Resume support: each interval saves one HDF5 file named by its time bounds.
+        # If that file already exists, this interval was completed on an earlier run, so
+        # skip the expensive CDAS fetches and recomputation. Keep it in the returned list
+        # so the downstream break-energy step still sees every interval's file.
+        outputFileName = 'VDF_eas_forFitting_' + timeRange[0].strftime('%Y%m%d%H%M%S') + '_' + timeRange[-1].strftime('%Y%m%d%H%M%S') + f'_{timeRes}.h5'
+        outputFilePath = os.path.join(output_dir, outputFileName)
+        if os.path.exists(outputFilePath):
+            print(f"Interval {id+1}/{len(time_ranges)} already processed ({outputFileName}), skip.")
+            processed_file_paths.append(outputFilePath)
+            continue
+
+        # MAG is required for the field-aligned transform, so it gates the interval:
+        # fetch it up front and skip intervals with no coverage at all. Partially
+        # covered intervals are handled per-epoch after slicing (epochs lacking MAG are
+        # dropped below), which also subsumes the boundary-truncation case.
+        # allowMissingMag=True keeps a fully MAG-less interval instead: every
+        # field-aligned product (pitch angle, v_par/v_perp, pad_in, B_avg,
+        # vp_transformed) is written as NaN so the MAG-free contents (PSD, counts,
+        # energies, densities, Vp) stay usable for isotropic analyses.
+        magData = get_SO_MAG_SRF_Normal(timeRange) # 0.125s resolution
+        hasMagData = (magData is not None and 'B_SRF' in magData
+                      and magData['B_SRF']['EPOCH'].size > 0)
+        if not hasMagData and not allowMissingMag:
+            print(f"\nWarning: No MAG data between {timeRange[0]} and {timeRange[1]}, skip this interval ...")
+            continue
+
+        # Extract desired period of EAS PSD
         psd1 = slice_xarrayEAS(psdEAS1, timeRange, timeFreq=timeRes) # psdEAS1 # If needed: slice_psdEAS(psdEAS1, timeRange)
         psd2 = slice_xarrayEAS(psdEAS2, timeRange, timeFreq=timeRes) # psdEAS2 # If needed: slice_psdEAS(psdEAS2, timeRange)
         if psd1 is None or psd2 is None:
@@ -1206,6 +1226,39 @@ def process_eas_data(eas1Files, eas2Files, countEAS1_files=None, countEAS2_files
 
         count1 = slice_xarrayEAS(countEAS1, timeRange, timeFreq=timeRes)
         count2 = slice_xarrayEAS(countEAS2, timeRange, timeFreq=timeRes)
+
+        # Drop epochs lacking MAG coverage so only fittable VDFs (those with a valid
+        # field-aligned frame) reach the output. magVector is NaN wherever MAG has no
+        # samples around the EAS time stamp, catching both boundary truncation and
+        # interior gaps. All time-indexed arrays are filtered together to stay aligned.
+        # An interval with partial MAG keeps the production per-epoch dropping even
+        # under allowMissingMag; only a fully MAG-less interval takes the NaN path.
+        hasMagCoverage = False
+        if hasMagData:
+            B_srf = magData['B_SRF'].copy()
+            magVector = average_MAG_around_timeStamp(B_srf, time_stamps)
+            validMagMask = ~np.isnan(magVector).any(axis=-1)
+            hasMagCoverage = bool(validMagMask.any())
+        if not hasMagCoverage:
+            if not allowMissingMag:
+                print(f"\nWarning: No MAG samples overlap any EAS epoch in {timeRange[0]} to {timeRange[1]}, skip this interval ...")
+                continue
+            print("No usable MAG in this interval; keeping it with NaN field-aligned products (allowMissingMag).")
+            magVector = np.full((len(time_stamps), 3), np.nan)
+        elif not validMagMask.all():
+            validEpochIdx = np.where(validMagMask)[0]
+            print(f"Dropped {len(validMagMask) - len(validEpochIdx)}/{len(validMagMask)} epochs lacking MAG coverage.")
+            psd1 = psd1.isel(EPOCH=validEpochIdx)
+            psd2 = psd2.isel(EPOCH=validEpochIdx)
+            count1 = count1.isel(EPOCH=validEpochIdx)
+            count2 = count2.isel(EPOCH=validEpochIdx)
+            time_stamps = time_stamps[validEpochIdx]
+            magVector = magVector[validEpochIdx]
+
+        # Drop the L1 saturation blocks from counts and PSD before any derived product.
+        count1, psd1, saturatedPixels1 = maskSaturatedCounts(count1, psd1, 'EAS1')
+        count2, psd2, saturatedPixels2 = maskSaturatedCounts(count2, psd2, 'EAS2')
+        saturatedPixelsPerEpoch = saturatedPixels1 + saturatedPixels2
 
         # Calculate uncertainties
         GF_EAS1 = load_geometric_factors('EAS1', count1)
@@ -1222,12 +1275,16 @@ def process_eas_data(eas1Files, eas2Files, countEAS1_files=None, countEAS2_files
         # Reshape and combine uncertainties
         unc_dataProduct1 = reshape_concatenate(unc_vdf_eas1.values, unc_vdf_eas2.values)
 
-        # MAG data
-        magData = get_SO_MAG_SRF_Normal(timeRange) # 0.125s resolution
-        B_srf = magData['B_SRF'].copy()
-        magVector = average_MAG_around_timeStamp(B_srf, time_stamps)#, timeFreq = timeRes)
-        PA_eas1 = getPitchAngle(vEAS1_srf, magVector, time_stamps) # magVector varies with time.
-        PA_eas2 = getPitchAngle(vEAS2_srf, magVector, time_stamps)
+        # B_srf / magVector already computed and gap-filtered above.
+        # The pitch-angle chain (getPitchAngle -> allocateGridIdx/np.digitize) is not
+        # NaN-safe, so a MAG-less interval fills the PA products directly instead of
+        # flowing NaN B through it.
+        if hasMagCoverage:
+            PA_eas1 = getPitchAngle(vEAS1_srf, magVector, time_stamps) # magVector 随时间变化.
+            PA_eas2 = getPitchAngle(vEAS2_srf, magVector, time_stamps)
+        else:
+            PA_eas1 = np.full((len(time_stamps), 16, 64, 32), np.nan)
+            PA_eas2 = np.full((len(time_stamps), 16, 64, 32), np.nan)
 
         # PAS velocity data
         pasData = get_SO_PAS_Grnd_Moment(timeRange) # 4s resolution
@@ -1239,19 +1296,22 @@ def process_eas_data(eas1Files, eas2Files, countEAS1_files=None, countEAS2_files
         PitchAngleBound = np.arange(0, 180 + grid_interval, grid_interval)# np.arange(0 - grid_interval / 2, 180 + grid_interval, grid_interval)
         PA_MidValue = (PitchAngleBound[:-1] + PitchAngleBound[1:]) / 2
 
-        # Find the Grid Indices of each data point
-        pitchAngIdx_Eas1 = allocateGridIdx(PA_eas1, PitchAngleBound, rightClosed=True)
-        pitchAngIdx_Eas2 = allocateGridIdx(PA_eas2, PitchAngleBound, rightClosed=True)
+        if hasMagCoverage:
+            # Find the Grid Indices of each data point
+            pitchAngIdx_Eas1 = allocateGridIdx(PA_eas1, PitchAngleBound, rightClosed=True)
+            pitchAngIdx_Eas2 = allocateGridIdx(PA_eas2, PitchAngleBound, rightClosed=True)
 
-        # Pitch Angle Distribution, pad_in
-        print('\nGenerating Pitch Angle Distribution...')
-        psd_PA_Energy = getPsdPitchAngleEnergy(
-            psdArray = {'eas1': psd1.values, 'eas2': psd2.values},
-            uncArray = {'eas1': unc_vdf_eas1.values, 'eas2': unc_vdf_eas2.values},
-            pitchAngIdx={'eas1': pitchAngIdx_Eas1, 'eas2': pitchAngIdx_Eas2},
-            pitchAngle=PA_MidValue
-        )  # shape: (time, energy bin = 64, pa bins = 36, (mean PSD [km^6/s^3], number of points) )
-        print('psd_PA_Energy done.')
+            # Pitch Angle Distribution, pad_in
+            print('\nGenerating Pitch Angle Distribution...')
+            psd_PA_Energy = getPsdPitchAngleEnergy(
+                psdArray = {'eas1': psd1.values, 'eas2': psd2.values},
+                uncArray = {'eas1': unc_vdf_eas1.values, 'eas2': unc_vdf_eas2.values},
+                pitchAngIdx={'eas1': pitchAngIdx_Eas1, 'eas2': pitchAngIdx_Eas2},
+                pitchAngle=PA_MidValue
+            )  # shape: (time, energy bin = 64, pa bins = 36, (mean PSD [km^6/s^3], number of points) )
+            print('psd_PA_Energy done.')
+        else:
+            psd_PA_Energy = np.full((len(time_stamps), 64, len(PA_MidValue), 3), np.nan)
 
         # Plot PAD vs time figure
         desiredEnergyIdx = np.where((energyEAS1 > 50)&(energyEAS1<2000))[0] # average over 50 - 2000 eV
@@ -1319,8 +1379,9 @@ def process_eas_data(eas1Files, eas2Files, countEAS1_files=None, countEAS2_files
             plt.close()
             print(f'\nPAD plot saved to {figname}')
 
-        psd_averaged = get_PAD(psd1, psd2, desiredEnergyIdx, time_stamps, pitchAngleVariables = pitchAngleBin_and_idxArray)
-        plot_PAD(psd_averaged, output_dir)
+        if hasMagCoverage:
+            psd_averaged = get_PAD(psd1, psd2, desiredEnergyIdx, time_stamps, pitchAngleVariables = pitchAngleBin_and_idxArray)
+            plot_PAD(psd_averaged, output_dir)
         
         # Download RPW_density
         print('Downloading RPW_density...')
@@ -1331,7 +1392,7 @@ def process_eas_data(eas1Files, eas2Files, countEAS1_files=None, countEAS2_files
             eDensity = protonDensity # If it's not available, use proton density from PAS
 
         if shift_SCPOT:
-            scpot_aligned = align_rpw_to_eas(rpw_data['SCPOT'], time_stamps) # sc potential aligned to EAS time stamps
+            scpot_aligned = align_rpw_to_eas(scpot_series, time_stamps) # sc potential aligned to EAS time stamps
 
             def fill_scpot_nan_with_local_mean(scpot_aligned, time_stamps, time_window_hours=3):
                 nan_mask = np.isnan(scpot_aligned.values)
@@ -1352,7 +1413,15 @@ def process_eas_data(eas1Files, eas2Files, countEAS1_files=None, countEAS2_files
                         # If no valid values in window, use global mean
                         if np.isnan(local_mean):
                             local_mean = np.nanmean(scpot_aligned.values)
-                        
+
+                        # Whole chunk without RPW SCPOT (e.g. 2022-01-01 06-24h, where
+                        # the L3 product has only a few points near 01:00): take the
+                        # nearest valid point of the fetched series instead of leaving
+                        # NaN, which would void the corrected energies and hence the
+                        # whole velocity grid of the chunk.
+                        if np.isnan(local_mean):
+                            local_mean = nearest_valid_scpot(scpot_series, current_time)
+
                         scpot_aligned.values[idx] = local_mean
                     
                     print(f"Replaced {len(nan_indices)} NaN SC potential values with {time_window_hours}-hour local mean")
@@ -1408,9 +1477,18 @@ def process_eas_data(eas1Files, eas2Files, countEAS1_files=None, countEAS2_files
             vEAS1_srf_for_vParaPerp = vEAS1_srf
             vEAS2_srf_for_vParaPerp = vEAS2_srf
         
-        # Calculate v_para and v_perp. # Not:(1) Subtract Vp from Vx, Vy, Vz; 
-        vParaEas1, vPerpEas1, vp_transformed = calc_VparaVperp(vEAS1_srf_for_vParaPerp, magVector, vpVector) 
-        vParaEas2, vPerpEas2, _ = calc_VparaVperp(vEAS2_srf_for_vParaPerp, magVector, vpVector)
+        # Calculate v_para and v_perp. # Not:(1) Subtract Vp from Vx, Vy, Vz;
+        if hasMagCoverage:
+            vParaEas1, vPerpEas1, vp_transformed = calc_VparaVperp(vEAS1_srf_for_vParaPerp, magVector, vpVector)
+            vParaEas2, vPerpEas2, _ = calc_VparaVperp(vEAS2_srf_for_vParaPerp, magVector, vpVector)
+        else:
+            perSensorShape = (len(time_stamps), 16, 64, 32)
+            vParaEas1 = np.full(perSensorShape, np.nan)
+            vPerpEas1 = np.full(perSensorShape, np.nan)
+            vParaEas2 = np.full(perSensorShape, np.nan)
+            vPerpEas2 = np.full(perSensorShape, np.nan)
+            vp_transformed = {"Vp_para": np.full(len(time_stamps), np.nan),
+                              "Vp_perp": np.full(len(time_stamps), np.nan)}
 
         psd_combined = reshape_concatenate(psd1.values, psd2.values) # shape: (time, 64, 16*32*2)
         PA_combined = reshape_concatenate(PA_eas1, PA_eas2)
@@ -1432,53 +1510,134 @@ def process_eas_data(eas1Files, eas2Files, countEAS1_files=None, countEAS2_files
             'vp_transformed': vp_transformed,
             'n_proton': protonDensity,
             'unc_pa_vec_in': unc_dataProduct1,
-            'scpot_aligned': scpot_aligned if shift_SCPOT else None
+            'scpot_aligned': scpot_aligned if shift_SCPOT else None,
+            'n_saturated_pixels': saturatedPixelsPerEpoch
         }
 
         # Save output to file
         if not os.path.exists(output_dir):
             os.makedirs(output_dir)
-        
-        fileName = 'VDF_eas_forFitting_' + timeRange[0].strftime('%Y%m%d%H%M%S') + '_' + timeRange[-1].strftime('%Y%m%d%H%M%S') + f'_{timeRes}.h5'
-        filePath = os.path.join(output_dir, fileName)
-        save_data_toHDF5(dataProduct_output, filePath)
-        processed_file_paths.append(filePath)
+
+        save_data_toHDF5(dataProduct_output, outputFilePath)
+        with h5py.File(outputFilePath, 'a') as h5:
+            h5.attrs['count_saturation_mask'] = f'counts >= {COUNT_SATURATION_VALUE} -> NaN counts and PSD'
+            if shift_SCPOT:
+                h5.attrs['scpot_source'] = (
+                    str(scpot_file) if scpot_file is not None
+                    else 'SOLO_L3_RPW-BIA-SCPOT-10-SECONDS (CDAS)')
+        processed_file_paths.append(outputFilePath)
     
     return processed_file_paths
 
+CROSSING_BREAK_ENERGY_METHOD = 'crossing'
+CONE_BREAK_ENERGY_METHOD = 'cone'
+
+
 def compute_break_energy_for_files(processed_file_paths, output_dir, break_energy_output_dir=None,
-         cone_half_width_deg=None, break_energy_workers=None):
-    """Run the cone-feature-split break energy detection on freshly preprocessed VDF files.
+         cone_half_width_deg=None, break_energy_workers=None,
+         break_energy_method=CROSSING_BREAK_ENERGY_METHOD):
+    """Run break energy detection on freshly preprocessed VDF files.
+
+    'crossing' (default) runs compute_break_energy_crossing: the joint
+    Maxwellian-core + power-law-tail fit whose break is the component crossing
+    (~7.7 kT_core), the method the comparison study selected.
+
+    'cone' is the legacy cone-feature split, kept only to reproduce older runs. Its
+    break anti-correlates with the core temperature and correlates with the
+    spacecraft potential, i.e. it tracks where the split was placed rather than a
+    physical break -- do not use it for new science.
 
     Defaults the output to results/break_energy/<output_dir name>/ so each
     preprocessing run keeps its own break energy products.
     """
-    from compute_break_energy_cone_features import (
-        DEFAULT_CONE_HALF_WIDTH_DEG,
-        DEFAULT_WORKERS,
-        runBreakEnergyPipeline,
-    )
-
     if break_energy_output_dir is None:
         run_name = os.path.basename(os.path.normpath(output_dir))
         break_energy_output_dir = str(REPO_ROOT / 'results' / 'break_energy' / run_name)
 
-    print(f"\nComputing break energy for {len(processed_file_paths)} processed file(s)...")
+    print(f"\nComputing break energy ({break_energy_method}) for "
+          f"{len(processed_file_paths)} processed file(s)...")
     print(f"Break energy output directory: {break_energy_output_dir}")
-    return runBreakEnergyPipeline(
-        inputFilePaths=processed_file_paths,
-        outputDir=break_energy_output_dir,
-        coneHalfWidthDeg=cone_half_width_deg if cone_half_width_deg is not None else DEFAULT_CONE_HALF_WIDTH_DEG,
-        workerCount=break_energy_workers if break_energy_workers is not None else DEFAULT_WORKERS,
-    )
+
+    if break_energy_method == CROSSING_BREAK_ENERGY_METHOD:
+        from compute_break_energy_crossing import (
+            CONE_HALF_WIDTH_DEG,
+            DEFAULT_WORKERS,
+            runCrossingPipeline,
+        )
+
+        # The files all live in output_dir; pass their names so stray files from other
+        # runs in the same directory are never picked up by the pattern glob.
+        return runCrossingPipeline(
+            vdfDir=output_dir,
+            outputDir=break_energy_output_dir,
+            fileNames=[os.path.basename(path) for path in processed_file_paths],
+            workers=break_energy_workers if break_energy_workers is not None else DEFAULT_WORKERS,
+            coneHalfWidthDeg=cone_half_width_deg if cone_half_width_deg is not None else CONE_HALF_WIDTH_DEG,
+        )
+
+    if break_energy_method == CONE_BREAK_ENERGY_METHOD:
+        from compute_break_energy_cone_features import (
+            DEFAULT_CONE_HALF_WIDTH_DEG,
+            DEFAULT_WORKERS,
+            runBreakEnergyPipeline,
+        )
+
+        return runBreakEnergyPipeline(
+            inputFilePaths=processed_file_paths,
+            outputDir=break_energy_output_dir,
+            coneHalfWidthDeg=cone_half_width_deg if cone_half_width_deg is not None else DEFAULT_CONE_HALF_WIDTH_DEG,
+            workerCount=break_energy_workers if break_energy_workers is not None else DEFAULT_WORKERS,
+        )
+
+    raise ValueError(
+        f"Unknown break_energy_method: {break_energy_method!r}. "
+        f"Use {CROSSING_BREAK_ENERGY_METHOD!r} or {CONE_BREAK_ENERGY_METHOD!r}.")
+
+
+class StreamTee:
+    """Mirror a stream to the console and a log file at once. The codebase
+    reports progress with print(), so teeing stdout/stderr captures every run
+    in a file without rewriting those calls to use the logging module."""
+
+    def __init__(self, primaryStream, logFile):
+        self.primaryStream = primaryStream
+        self.logFile = logFile
+
+    def write(self, message):
+        self.primaryStream.write(message)
+        self.logFile.write(message)
+        # Flush eagerly so `tail -f` stays live and a crash keeps the tail.
+        self.primaryStream.flush()
+        self.logFile.flush()
+
+    def flush(self):
+        self.primaryStream.flush()
+        self.logFile.flush()
+
+
+def setupRunLogging(output_dir):
+    """Tee stdout and stderr into a timestamped log file under output_dir so
+    every run is recorded automatically. Returns the open file handle, which
+    must stay referenced for the process lifetime to keep the log writable."""
+    os.makedirs(output_dir, exist_ok=True)
+    runTimestamp = pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')
+    logPath = os.path.join(output_dir, f'preprocess_{runTimestamp}.log')
+    logFile = open(logPath, 'a', buffering=1)
+    # Tee against the real streams so repeated calls do not nest tees.
+    sys.stdout = StreamTee(sys.__stdout__, logFile)
+    sys.stderr = StreamTee(sys.__stderr__, logFile)
+    print(f"Logging this run to {logPath}")
+    return logFile
 
 
 def preprocess_main(eas1_files=None, eas2_files=None, count_eas1_files=None, count_eas2_files=None,
          start_time=None, end_time=None, time_resolution='1min', custom_timeRange=None, shift_SCPOT=False,
-         download_dir=None, output_dir=None, compute_break_energy=True, break_energy_output_dir=None,
-         cone_half_width_deg=None, break_energy_workers=None):
+         scpot_file=None, download_dir=None, output_dir=None, compute_break_energy=True,
+         break_energy_output_dir=None, cone_half_width_deg=None, break_energy_workers=None,
+         break_energy_method=CROSSING_BREAK_ENERGY_METHOD,
+         psd_source='soar', allowMissingMag=False):
 
-    # Set default paths relative to the repository root if not provided
+    # Default paths relative to the repository root if not provided
     if download_dir is None:
         download_dir = str(REPO_ROOT / 'data')
 
@@ -1488,7 +1647,10 @@ def preprocess_main(eas1_files=None, eas2_files=None, count_eas1_files=None, cou
     # Create download and output directories if they don't exist
     os.makedirs(download_dir, exist_ok=True)
     os.makedirs(output_dir, exist_ok=True)
-    
+
+    # Record the whole run to a log file alongside its outputs.
+    runLogFile = setupRunLogging(output_dir)
+
     # Check for required parameters
     if not eas1_files and not eas2_files and (not start_time or not end_time):
         raise ValueError("Either provide file paths (eas1_files, eas2_files) or time range (start_time, end_time)")
@@ -1499,14 +1661,25 @@ def preprocess_main(eas1_files=None, eas2_files=None, count_eas1_files=None, cou
     else:
         if not start_time or not end_time:
             raise ValueError("Start time and end time are required for downloading data")
-            
-        print(f"Downloading EAS data files for period: {start_time} to {end_time}")
-        downloaded_files = download_eas_data(start_time, end_time, save_dir=os.path.join(download_dir, 'vdfs'))
-        
-        # Separate EAS1 and EAS2 files
-        eas1_files = [f for f in downloaded_files if 'eas1' in f.lower()]
-        eas2_files = [f for f in downloaded_files if 'eas2' in f.lower()]
-        
+
+        vdf_download_dir = os.path.join(download_dir, 'vdfs')
+        if psd_source == 'soar':
+            # SOAR standard L2 PSD: not limited to 2022, returns sensors pre-split.
+            print(f"Downloading EAS L2 PSD from SOAR for period: {start_time} to {end_time}")
+            eas1_files, eas2_files = downloadSoL2PsdNm3d([start_time, end_time], downloadDir=vdf_download_dir)
+        elif psd_source == 'local':
+            # Reuse files already on disk (e.g. from a prior 'soar' run) instead of querying SOAR.
+            print(f"Discovering local EAS L2 PSD files for period: {start_time} to {end_time}")
+            eas1_files, eas2_files = discoverLocalL2Psd([start_time, end_time], downloadDir=vdf_download_dir)
+        elif psd_source == 'mssl':
+            # MSSL corrLPP PSD-Corrected quicklooks (2022 only); flat list split by sensor.
+            print(f"Downloading EAS L2 PSD from MSSL for period: {start_time} to {end_time}")
+            downloaded_files = download_eas_data(start_time, end_time, save_dir=vdf_download_dir)
+            eas1_files = [f for f in downloaded_files if 'eas1' in f.lower()]
+            eas2_files = [f for f in downloaded_files if 'eas2' in f.lower()]
+        else:
+            raise ValueError(f"Unknown psd_source: {psd_source!r}. Use 'soar', 'local', or 'mssl'.")
+
         if not eas1_files or not eas2_files:
             print("Warning: Failed to download either EAS1 or EAS2 files")
             return []
@@ -1514,7 +1687,7 @@ def preprocess_main(eas1_files=None, eas2_files=None, count_eas1_files=None, cou
 
     # Process the data files
     print("\nProcessing EAS files...")
-    processed_file_paths = process_eas_data(eas1_files, eas2_files,  count_eas1_files, count_eas2_files, download_dir, output_dir,  timeRes=time_resolution, custom_timeRange=custom_timeRange, shift_SCPOT=shift_SCPOT)
+    processed_file_paths = process_eas_data(eas1_files, eas2_files,  count_eas1_files, count_eas2_files, download_dir, output_dir,  timeRes=time_resolution, custom_timeRange=custom_timeRange, shift_SCPOT=shift_SCPOT, scpot_file=scpot_file, allowMissingMag=allowMissingMag, psd_source=psd_source)
     
     print(f"\nProcessing complete. {len(processed_file_paths)} output files generated:")
     for path in processed_file_paths:
@@ -1527,31 +1700,29 @@ def preprocess_main(eas1_files=None, eas2_files=None, count_eas1_files=None, cou
             break_energy_output_dir=break_energy_output_dir,
             cone_half_width_deg=cone_half_width_deg,
             break_energy_workers=break_energy_workers,
+            break_energy_method=break_energy_method,
         )
 
     return processed_file_paths
 
 if __name__ == "__main__":
-    # Template: preprocess one 6-hour segment of SWA-EAS data.
-    #
-    # Download the L2 PSD and L1 count CDF files from SOAR first (see
-    # docs/TUTORIAL.md), place them under data/vdfs/ and data/L1_Count/,
-    # and list them below. Leave count files as None to auto-download via
-    # sunpy-soar. Each preprocessed output covers the time span of one
-    # input CDF pair (typically 6 hours).
-    dataDir = REPO_ROOT / 'data' / 'vdfs'
-    countDir = REPO_ROOT / 'data' / 'L1_Count'
+    # Workshop example: two continuous days, 2023-04-04 and 2023-04-05.
+    # Both the L2 PSD and the L1 counts are located from the time range alone:
+    # psd_source='local' reuses the CDFs already under data/vdfs and data/L1_Count
+    # (use 'soar' to download them; both keep only the newest version of each window).
+    # The spacecraft potential comes from the SOAR RPW L3 daily files, reduced to a
+    # 20 s table by build_scpot_table_from_soar_l3.py (the CDAWeb 10-second product
+    # the automatic route uses ends on 2023-01-01).
+    # Running both days in ONE call keeps the 6-hour chunks anchored on the first
+    # EAS epoch of 04-04; the last chunk ends where the data end.
+    outputDir = REPO_ROOT / 'data' / 'processed' / '2023-04-04_05'
+    scpotTable = CALIBRATION_DIR / 'scpot_rpw_l3_20230404_20230405_20s.csv'
 
-    eas1File = [str(dataDir / 'solo_L2_swa-eas1-nm3d-psd_20220302T060509-20220302T120459_corrLPP_V01.cdf')]
-    eas2File = [str(dataDir / 'solo_L2_swa-eas2-nm3d-psd_20220302T060509-20220302T120459_corrLPP_V01.cdf')]
-    countEAS1_files = [str(countDir / 'solo_L1_swa-eas1-NM3D_20220302T060509-20220302T120459_V01.cdf')]
-    countEAS2_files = [str(countDir / 'solo_L1_swa-eas2-NM3D_20220302T060509-20220302T120459_V01.cdf')]
-
-    processed_file_paths = preprocess_main(
-        eas1_files=eas1File, eas2_files=eas2File,
-        count_eas1_files=countEAS1_files, count_eas2_files=countEAS2_files,
-        output_dir=str(REPO_ROOT / 'data' / 'processed'),
-        shift_SCPOT=True,           # correct electron energies by spacecraft potential (recommended)
-        compute_break_energy=True,  # also produce *_cone_feature_split.pkl for the fitting step
-    )
+    processed_file_paths = preprocess_main(start_time='2023-04-04 00:00:00',
+                                           end_time='2023-04-05 23:59:59',
+                                           psd_source='local',
+                                           shift_SCPOT=True,
+                                           scpot_file=str(scpotTable),
+                                           output_dir=str(outputDir),
+                                           compute_break_energy=False)
     print(processed_file_paths)

@@ -12,13 +12,18 @@ joblib==1.5.0
 tqdm==4.66.1
 num2tex==0.8
 
+# Example notebooks (examples/*.ipynb)
+jupyter
+ipykernel
+
 # Preprocessing from raw Solar Orbiter CDF files
 astropy==5.3.4
 xarray==2023.10.1
 cdasws==1.7.43
+cdflib==1.2.1
 requests==2.32.3
 beautifulsoup4==4.13.4
 
-# Optional: automatic L1 count download from SOAR
+# SOAR downloads (EAS L2 PSD and L1 count files, RPW L3 potential files)
 sunpy==5.0.1
 sunpy-soar==1.10
