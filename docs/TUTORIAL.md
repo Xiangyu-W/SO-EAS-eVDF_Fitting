@@ -1,7 +1,9 @@
 # Tutorial — SO-EAS eVDF Fitting Pipeline
 
-This guide covers how to run the pipeline. For the scientific background and
-the fitting method, see the [README](../README.md).
+This guide covers how to run the reduced chi-square pipeline (the previous
+version of the fit). For its scientific background and method, see
+[README_chi2_legacy.md](../README_chi2_legacy.md); the current Poisson fit is
+introduced in the main [README](../README.md).
 
 ## Pipeline overview
 
