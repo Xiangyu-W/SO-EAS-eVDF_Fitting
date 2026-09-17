@@ -7,7 +7,7 @@ Fit the **core**, **halo** and **strahl** of the electron velocity distribution 
 
 ---
 
-## Two fitting methods
+<!-- ## Two fitting methods
 
 | method | objective | status | where |
 |---|---|---|---|
@@ -16,7 +16,7 @@ Fit the **core**, **halo** and **strahl** of the electron velocity distribution 
 
 Both share the same preprocessing and the same three-component model.
 
-**Why Poisson.** Above ~100 eV most EAS pixels register zero counts. A chi-square fit on the detected pixels sees only the upward fluctuations of a faint tail. On the example data it returns a halo ten times denser and three times hotter than the Poisson fit of the same epochs. On synthetic data with a known truth, the Poisson fit stays unbiased down to a tenth of the observed count level ([notebook 07](examples/07_poisson_vs_chi2_low_counts.ipynb)).
+**Why Poisson.** Above ~100 eV most EAS pixels register zero counts. A chi-square fit on the detected pixels sees only the upward fluctuations of a faint tail. On the example data it returns a halo ten times denser and three times hotter than the Poisson fit of the same epochs. On synthetic data with a known truth, the Poisson fit stays unbiased down to a tenth of the observed count level ([notebook 07](examples/07_poisson_vs_chi2_low_counts.ipynb)). -->
 
 > **S3Park 2026 hands-on session (18 September 2026):** start at [workshop/README.md](workshop/README.md). The tag `s3park-2026` is the version presented.
 
