@@ -1,0 +1,16 @@
+2026-09-17 00:57:26  1 files, 4 workers, objective=poisson, halo drift free -> /disk/plasma/xw2/SO-EAS-eVDF_Fitting/results/fitting/example_run_poisson
+2026-09-17 00:57:26  [1/1] VDF_eas_forFitting_20230404005008_20230404011908_1min.h5 (30 epochs)
+2026-09-17 00:58:30      30/30 epochs (1.1 min)
+2026-09-17 00:58:30      done: 30 rows, 0 failed -> VDF_eas_forFitting_20230404005008_20230404011908_1min_fit.csv
+2026-09-17 00:58:30  merged 1 file CSVs -> summary.csv (30 rows)
+2026-09-17 01:02:05  1 files, 4 workers, objective=poisson, halo drift free -> /disk/plasma/xw2/SO-EAS-eVDF_Fitting/results/fitting/example_run_poisson
+2026-09-17 01:02:05  [1/1] VDF_eas_forFitting_20230404005008_20230404011908_1min.h5 already complete, skipping
+2026-09-17 01:02:05  merged 1 file CSVs -> summary.csv (30 rows)
+2026-09-17 10:03:27  1 files, 4 workers, objective=poisson, halo drift free -> /disk/plasma/xw2/SO-EAS-eVDF_Fitting/results/fitting/example_run_poisson
+2026-09-17 10:03:27  [1/1] VDF_eas_forFitting_20230404005008_20230404011908_1min.h5 (30 epochs)
+2026-09-17 10:04:30      30/30 epochs (1.1 min)
+2026-09-17 10:04:30      done: 30 rows, 0 failed -> VDF_eas_forFitting_20230404005008_20230404011908_1min_fit.csv
+2026-09-17 10:04:30  merged 1 file CSVs -> summary.csv (30 rows)
+2026-09-17 10:07:26  1 files, 4 workers, objective=poisson, halo drift free -> /disk/plasma/xw2/SO-EAS-eVDF_Fitting/results/fitting/example_run_poisson
+2026-09-17 10:07:26  [1/1] VDF_eas_forFitting_20230404005008_20230404011908_1min.h5 already complete, skipping
+2026-09-17 10:07:26  merged 1 file CSVs -> summary.csv (30 rows)
