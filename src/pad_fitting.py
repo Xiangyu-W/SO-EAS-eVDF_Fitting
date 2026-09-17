@@ -140,3 +140,52 @@ def evaluate_pad_conditions(mean_pad_params, beam_ratio_cond, deficit_ratio_cond
     anti_par_def_cond = (beta_anti_par < -0.5)
     return par_strahl_cond, anti_par_strahl_cond, par_def_cond, anti_par_def_cond
 
+
+
+# Two-tier scheme (2026-08 revision, validated on 2022-01-02/09 chunks):
+# beta > 2 is Owen et al. 2022's "meaningful strahl" (strong tier, narrow
+# beam), 0.6 < beta <= 2 is a weak/scattered beam that VDF fitting still
+# needs (weak tier), and the pitch-angle-width cap is relaxed from 45 to 60
+# deg (high-beta scattered strahl reaches ~50-65 deg and was being rejected).
+TWO_TIER_STRONG_BETA = 2.0
+TWO_TIER_WEAK_BETA = 0.6
+TWO_TIER_PAW_MAX_DEG = 60.0
+TWO_TIER_DEFICIT_BETA = -0.5
+
+
+def evaluate_pad_conditions_two_tier(mean_pad_params, pitch_angle_centers=None):
+    """Two-tier strahl classification from a fitted mean-PAD model.
+
+    Returns a dict with per-side tiers (0 = none, 1 = weak, 2 = strong), the
+    beta contrasts, fitted pitch-angle widths (FWHM, deg) and a deficit label
+    ('', 'par', 'anti' or 'both'; beta < -0.5 on that side).
+    """
+    pawPar = float(PAW_coeff * mean_pad_params['W_0'].value)
+    pawAnti = float(PAW_coeff * mean_pad_params['W_180'].value)
+
+    pitchGrid = np.arange(0, 185, 5)
+    perpMean = np.mean(pad_model.eval(
+        mean_pad_params, alpha=pitchGrid[(pitchGrid >= 65) & (pitchGrid <= 115)]))
+    betaPar = float(np.mean(pad_model.eval(
+        mean_pad_params, alpha=pitchGrid[pitchGrid <= 45])) / perpMean - 1)
+    betaAnti = float(np.mean(pad_model.eval(
+        mean_pad_params, alpha=pitchGrid[pitchGrid >= 135])) / perpMean - 1)
+
+    def sideTier(beta, paw):
+        if not np.isfinite(beta) or paw > TWO_TIER_PAW_MAX_DEG:
+            return 0
+        if beta > TWO_TIER_STRONG_BETA:
+            return 2
+        if beta > TWO_TIER_WEAK_BETA:
+            return 1
+        return 0
+
+    parDeficit = np.isfinite(betaPar) and betaPar < TWO_TIER_DEFICIT_BETA
+    antiDeficit = np.isfinite(betaAnti) and betaAnti < TWO_TIER_DEFICIT_BETA
+    deficit = ('both' if parDeficit and antiDeficit
+               else 'par' if parDeficit else 'anti' if antiDeficit else '')
+    return {'par_tier': sideTier(betaPar, pawPar),
+            'anti_tier': sideTier(betaAnti, pawAnti),
+            'beta_par': betaPar, 'beta_anti': betaAnti,
+            'paw_par_deg': pawPar, 'paw_anti_deg': pawAnti,
+            'deficit': deficit}

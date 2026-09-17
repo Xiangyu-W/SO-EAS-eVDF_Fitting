@@ -115,6 +115,18 @@ def getScpotValue(spacecraftPotential: object) -> float:
     return float(np.asarray(potentialValue).ravel()[0])
 
 
+# Files preprocessed with shift_SCPOT=False store scpot_aligned as None; fall back to
+# no potential correction so the low-energy cutoff stays at LOW_ENERGY_BASE_EV.
+NO_SCPOT_CORRECTION_VALUE = 0.0
+
+
+def resolveSpacecraftPotentials(spacecraftPotentialData: object, epochCount: int) -> np.ndarray:
+    """Per-epoch spacecraft potential array; zeros when the file carries none."""
+    if spacecraftPotentialData is None:
+        return np.full(epochCount, NO_SCPOT_CORRECTION_VALUE)
+    return np.asarray(getattr(spacecraftPotentialData, "values", spacecraftPotentialData))
+
+
 def getEnergyChannelLimits(solarWindEnergy: np.ndarray, spacecraftPotential: float) -> tuple[int, int] | None:
     upperEnergyIndices = np.where(solarWindEnergy < ENERGY_MAX_EV)[0]
     lowerEnergyIndices = np.where(solarWindEnergy > (LOW_ENERGY_BASE_EV - spacecraftPotential))[0]
