@@ -105,6 +105,48 @@ def calculate_vdf_from_count(count_data, gf_data, qe_data, instrument):
     return m_e_eV**2 * count_data / (2 * dT * count_data[energy_coord]**2 * gf_km * qe_data)
 
 
+NUM_ELEVATIONS = 16
+NUM_ENERGIES = 64
+NUM_AZIMUTHS = 32
+
+
+def extractInstrumentEnergy(countData, instrument):
+    """The sensor's own (unshifted) energy table, shape (64,), from a count xarray.
+
+    Files that carry the table per epoch use the first epoch, as the
+    quantum-efficiency loader does."""
+    energy = countData.coords[f'SWA_{instrument}_ENERGY']
+    if 'EPOCH' in energy.dims:
+        energy = energy.isel(EPOCH=0)
+    return np.asarray(energy.values, dtype=float)
+
+
+def buildOneCountPsdField(instrumentEnergyEas1, instrumentEnergyEas2):
+    """Static PSD-per-count conversion g(energy, slot), shape (64, 1024).
+
+    g is the factor calculate_vdf_from_count applies to one count -- the same
+    factor the L2 pipeline used, so PSD == g * count for every pixel. The
+    Poisson fit needs it on zero-count pixels too, which is why it is stored
+    rather than recovered from PSD/count. Slot ordering matches pa_vec_in
+    (reshape_concatenate): EAS1's 512 (elevation*32 + azimuth) then EAS2's 512.
+    Each sensor uses its own energy table (EAS2 runs ~4 % below EAS1)."""
+    perSensor = []
+    for instrument, energy in (('EAS1', instrumentEnergyEas1), ('EAS2', instrumentEnergyEas2)):
+        energyCoord = f'SWA_{instrument}_ENERGY'
+        oneCount = xr.DataArray(
+            np.ones((1, NUM_ELEVATIONS, NUM_ENERGIES, NUM_AZIMUTHS)),
+            dims=['EPOCH', 'SWA_EAS_ELEVATION', energyCoord, 'SWA_EAS_AZIMUTH'],
+            coords={'SWA_EAS_ELEVATION': np.arange(NUM_ELEVATIONS),
+                    'SWA_EAS_AZIMUTH': np.arange(NUM_AZIMUTHS),
+                    energyCoord: np.asarray(energy, dtype=float)})
+        geometricFactor = load_geometric_factors(instrument, oneCount)
+        quantumEfficiency = load_quantum_efficiency(instrument, oneCount)
+        perSensor.append(np.asarray(
+            calculate_vdf_from_count(oneCount, geometricFactor, quantumEfficiency, instrument).values,
+            dtype=float))
+    return reshape_concatenate(perSensor[0], perSensor[1])[0]
+
+
 # --- Read EAS Data ---
 def readCDFs(filePaths, skip_errors=False):
     cdas = CdasWs()
@@ -1278,6 +1320,12 @@ def process_eas_data(eas1Files, eas2Files, countEAS1_files=None, countEAS2_files
         # Reshape and combine uncertainties
         unc_dataProduct1 = reshape_concatenate(unc_vdf_eas1.values, unc_vdf_eas2.values)
 
+        # One-count PSD field for the Poisson fit, from the same GF/QE tables:
+        # exact on zero-count pixels, where PSD / counts cannot recover it.
+        instrumentEnergyEas1 = extractInstrumentEnergy(count1, 'EAS1')
+        instrumentEnergyEas2 = extractInstrumentEnergy(count2, 'EAS2')
+        oneCountPsdField = buildOneCountPsdField(instrumentEnergyEas1, instrumentEnergyEas2)
+
         # B_srf / magVector already computed and gap-filtered above.
         # The pitch-angle chain (getPitchAngle -> allocateGridIdx/np.digitize) is not
         # NaN-safe, so a MAG-less interval fills the PA products directly instead of
@@ -1514,7 +1562,10 @@ def process_eas_data(eas1Files, eas2Files, countEAS1_files=None, countEAS2_files
             'n_proton': protonDensity,
             'unc_pa_vec_in': unc_dataProduct1,
             'scpot_aligned': scpot_aligned if shift_SCPOT else None,
-            'n_saturated_pixels': saturatedPixelsPerEpoch
+            'n_saturated_pixels': saturatedPixelsPerEpoch,
+            'one_count_psd_in': oneCountPsdField,
+            'instrument_energy_eas1_eV': instrumentEnergyEas1,
+            'instrument_energy_eas2_eV': instrumentEnergyEas2,
         }
 
         # Save output to file
@@ -1524,6 +1575,11 @@ def process_eas_data(eas1Files, eas2Files, countEAS1_files=None, countEAS2_files
         save_data_toHDF5(dataProduct_output, outputFilePath)
         with h5py.File(outputFilePath, 'a') as h5:
             h5.attrs['count_saturation_mask'] = f'counts >= {COUNT_SATURATION_VALUE} -> NaN counts and PSD'
+            h5['one_count_psd_in'].attrs['description'] = (
+                'Static PSD-per-count conversion g(energy, slot), native PSD units, '
+                'from the GF/QE tables (calculate_vdf_from_count on one count); '
+                'slots ordered as pa_vec_in.')
+            h5['one_count_psd_in'].attrs['method'] = 'gfqe'
             if shift_SCPOT:
                 h5.attrs['scpot_source'] = (
                     str(scpot_file) if scpot_file is not None
