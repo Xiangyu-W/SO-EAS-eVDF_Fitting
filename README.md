@@ -135,7 +135,7 @@ In situ measurements from Solar Orbiter, from the [Solar Orbiter Archive (SOAR)]
 
 MAG, PAS and the RPW density are fetched through [cdasws](https://pypi.org/project/cdasws/) during preprocessing. So is the RPW potential before 2023; from 2023 on it comes from the SOAR RPW L3 daily files. The EAS geometric factors and efficiencies ship under `examples/example_data/`.
 
-The two full example days (2023-04-04 and 2023-04-05, 4.8 GB preprocessed) are the GitHub release `s3park-2026`. `python workshop/download_example_days.py` fetches and verifies them.
+The preprocessed files of the two full example days (2023-04-04 and 2023-04-05, 4.8 GB) are too large to distribute; their reference fit ships in `results/fitting/example_days_2023-04-04_05/summary.csv`. To rebuild the files, see [workshop/README.md](workshop/README.md).
 
 ---
 

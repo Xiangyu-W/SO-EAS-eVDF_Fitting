@@ -47,21 +47,19 @@ the pipeline on a long interval.
   one-minute epochs of 2023-04-04 00:50-01:19 UT (0.33 au, strong
   anti-parallel strahl in 27 of them), with its break energies. See
   `examples/example_data/README.md` for provenance.
-- **Release asset** `s3park-2026`: the two full days 2023-04-04 and
-  2023-04-05 as eight six-hour preprocessed files (about 600 MB each, 4.8 GB
-  in total), their break-energy CSVs, the reference fit (2 850 epochs,
-  figures every tenth epoch) and `SHA256SUMS`.
+- **The two full days** 2023-04-04 and 2023-04-05 (2 849 epochs): the
+  reference fit ships in
+  `results/fitting/example_days_2023-04-04_05/summary.csv`. The eight
+  six-hour preprocessed files (about 600 MB each, 4.8 GB in total) are too
+  large to distribute; rebuild them from the SOAR files:
 
 ```bash
-python workshop/download_example_days.py                     # everything, ~4.9 GB
-python workshop/download_example_days.py --day 2023-04-04 --chunks 00   # one file, ~580 MB
-python workshop/download_example_days.py --reference-only    # the reference fit only
-```
-
-The script verifies every file and skips what is already complete. Then:
-
-```bash
-PYTHONPATH=src python -m evdf_poisson.runner --data-dir data/example_days_2023-04-04_05 \
+# main block of the preprocessor: these two days. Set psd_source='soar' there to
+# download the raw EAS files first (about 830 MB per six hours).
+PYTHONPATH=src python src/preprocess_data_for_fit_hdf5.py
+PYTHONPATH=src python src/compute_break_energy_crossing.py --vdf-dir data/processed/2023-04-04_05 \
+    --output-dir data/processed/2023-04-04_05
+PYTHONPATH=src python -m evdf_poisson.runner --data-dir data/processed/2023-04-04_05 \
     --out results/fitting/my_two_days --workers 8 --plot-every 60
 ```
 

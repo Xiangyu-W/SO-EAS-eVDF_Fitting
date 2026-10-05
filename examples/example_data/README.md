@@ -21,7 +21,7 @@ The spacecraft potential is the SOAR RPW L3 `rpw-bia-scpot` product
 The file holds epochs 50-79 of the six-hour segment
 `VDF_eas_forFitting_20230404000008_20230404060008_1min.h5`: 27 epochs carry a strong anti-parallel strahl, 2 a weak one and 1 get no strahl verdict (the no-strahl branch of the fit is exercised too); all have a valid crossing break energy; 4 epochs carry masked L1 saturation blocks below the energy cut. The demonstration epoch of the notebooks
 is epoch 20 (01:10:08 UT). The full two days (2 850 epochs, eight files,
-4.8 GB) are distributed as a GitHub release; see `workshop/README.md`. The
+4.8 GB) are not distributed; `workshop/README.md` shows how to rebuild them. The
 reference fit of the subset is `results/fitting/example_run_poisson/`, that
 of the two days `results/fitting/example_days_2023-04-04_05/summary.csv`.
 

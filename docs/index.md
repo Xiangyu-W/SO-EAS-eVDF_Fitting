@@ -45,7 +45,7 @@ their outputs.
   break energy with the cone-split method. Its original README is kept as
   [README_chi2_legacy.md](../README_chi2_legacy.md).
 - [S3Park 2026 hands-on session](../workshop/README.md): the 20-minute
-  session, the two-day example data release, how to run your own interval.
+  session, the two-day example, how to run your own interval.
 
 ## Your own data
 

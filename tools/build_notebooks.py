@@ -883,7 +883,8 @@ fig.autofmt_xdate(); fig.tight_layout()''')
 
 The example subset is half an hour out of a two-day run: 2 850 one-minute epochs in
 eight six-hour files, fitted with the same code in about 12 minutes on 32 cores. The
-preprocessed files (4.8 GB) are a release asset (see `workshop/README.md`). The fit
+preprocessed files (4.8 GB) are not distributed (`workshop/README.md` shows how to
+rebuild them). The fit
 results ship in `results/fitting/example_days_2023-04-04_05/summary.csv`, so this
 section runs offline.''')
     nb.code('''days = pd.read_csv(DAYS_DIR / 'summary.csv')
