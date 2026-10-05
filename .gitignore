@@ -16,12 +16,17 @@ results/fitting/example_run/data/chunks/
 results/fitting/example_days_2023-04-04_05/plots/
 results/fitting/example_days_2023-04-04_05/per_file/
 results/fitting/example_days_2023-04-04_05/video/
+results/fitting/example_run_poisson/plots_testF/
 logs/
 
 # Downloaded raw data, preprocessing outputs and release staging
 /data/
 /release/
 workshop/html/
+workshop/make_slide_figures.py  
+workshop/RELEASE_NOTES.md 
+workshop/SESSION_SCRIPT.md 
+workshop/slides_outline.md
 *.tmp
 
 # Maintainer tools: only the notebook sources and the example-subset cutter ship
