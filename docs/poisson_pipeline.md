@@ -32,10 +32,13 @@ box constraints). `objective='chi2'` replaces the residual by
 $\log_{10} f_\text{model} - \log_{10} f$ on pixels with $C_i > 0$ (the
 literature baseline; kept for comparison, see notebook 07).
 
-The one-count PSD is $g = m_e^2 / (2\,\Delta t\, E^2\, G\, Q)$. Files that
-carry a static `one_count_psd_in` field use it; otherwise `loadEpoch`
-recovers $g$ per epoch from PSD / counts (exact where counts > 0, energy-row
-median for dark pixels).
+The one-count PSD is $g = m_e^2 / (2\,\Delta t\, E^2\, G\, Q)$. The
+preprocessing evaluates it from the geometric-factor and efficiency tables and
+writes the static `one_count_psd_in` field, exact for every pixel; energy
+steps without a single count therefore enter the likelihood as zero-count
+pixels. Files without the field fall back to a per-epoch recovery from
+PSD / counts (exact where counts > 0, energy-row median for dark pixels,
+energy steps without any count excluded).
 
 ## Inputs determined before the fit
 

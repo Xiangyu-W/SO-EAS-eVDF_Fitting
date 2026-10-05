@@ -170,8 +170,10 @@ belongs to the instrument, not the plasma, and exists for every pixel, empty one
 included. That is what lets the Poisson fit use zero-count pixels: a model PSD becomes
 an expected number of counts, $\\mu = f_\\text{model} / g$, to compare with the observed $C$.
 
-`loadEpoch` recovers $g$ as PSD / counts where counts > 0 (exact) and uses the median of
-the energy row for empty pixels.''')
+The preprocessing evaluates $g$ from the geometric-factor and efficiency tables for
+every pixel and stores it in the file (`one_count_psd_in`); `loadEpoch` reads it. Files
+written before that field existed fall back to PSD / counts where counts > 0 (exact)
+and the median of the energy row for empty pixels.''')
     nb.code('''detected = grid['valid'] & (counts > 0)
 print('PSD / counts equals the stored one-count level on every detected pixel:',
       np.allclose(psd[detected] / counts[detected], grid['one_count_psd'][detected], rtol=1e-9))
@@ -1111,7 +1113,7 @@ ax.axvspan(0.01, 1, color='0.9', label='typical suprathermal EAS pixel'); ax.leg
     nb.md('''## 5. Conclusions
 
 - Same model, stages and ranges: the objective alone changes the halo density by an
-  order of magnitude, its temperature by a factor 3 and $\\kappa_h$ from ~5.3 to ~2.8
+  order of magnitude, its temperature by a factor 3 and $\\kappa_h$ from ~5.6 to ~2.8
   on this data.
 - Reduced chi-square on detected pixels does not diagnose the problem; the Poisson
   deviance on all pixels does.
@@ -1149,8 +1151,9 @@ interval. The other notebooks start from the bundled example and need none of th
    a table afterwards (section 2);
 5. rotate every pixel into the field-aligned frame: pitch angle, $v_\\parallel$,
    $v_\\perp$;
-6. merge the heads into one 64 x 1024 grid, build the 18-bin PAD, resample to 1 minute,
-   write compressed.
+6. merge the heads into one 64 x 1024 grid, build the 18-bin PAD, resample to 1 minute;
+7. evaluate the one-count level $g$ of every pixel from the geometric factors and
+   efficiencies (exact on empty pixels too), write compressed.
 
 The EAS geometric factors and efficiencies ship in `examples/example_data/`.''')
     nb.code(SETUP_CELL)
@@ -1248,6 +1251,8 @@ One time-indexed dataset per quantity:
   $v_\\perp$, counts per pixel);
 - `pad_in`: the pitch-angle distribution;
 - `n_saturated_pixels`: the saturation census of step 2;
+- `one_count_psd_in`: the one-count level $g$ of every pixel (64 x 1024, static), with
+  the energy table of each head (`instrument_energy_eas1_eV`, `instrument_energy_eas2_eV`);
 - the rest: ancillary measurements per epoch.
 
 The attributes record where the potential came from and what was masked.''')
@@ -1674,7 +1679,7 @@ The rules used on month-long runs at 1 au (January 2022, 30 000 epochs):
 
 On that month 0.8 % of the epochs were *strong* and 1.3 % *wedge*. On the 30 example
 epochs the strong rule fires on most and the wedge rule on nearly all. The reason is
-the count level: at 0.33 au the grid holds 35 000 valid pixels with up to ~15 counts at
+the count level: at 0.33 au the grid holds 44 000 valid pixels with up to ~15 counts at
 the peak, so the tests resolve the limits of the model itself, not fluctuations. A
 single truncated bi-kappa cannot reproduce both the shoulder and the tail of the
 strahl; the wedge $R$ of 1.3-1.8 says exactly that.
