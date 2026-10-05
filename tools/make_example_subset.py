@@ -23,7 +23,8 @@ sys.path.insert(0, str(REPO_ROOT / 'src'))
 from data_io import load_data                      # noqa: E402
 from preprocess_data_for_fit_hdf5 import save_data_toHDF5   # noqa: E402
 
-STATIC_KEYS = {'pitch_angles'}   # every other array is time-indexed on axis 0
+STATIC_KEYS = {'pitch_angles', 'one_count_psd_in',
+               'instrument_energy_eas1_eV', 'instrument_energy_eas2_eV'}   # every other array is time-indexed on axis 0
 
 
 def sliceTimeAxis(value, epochCount, epochBegin, epochEnd):
@@ -59,6 +60,9 @@ def cutSubset(sourcePath, epochBegin, epochEnd, outputDir):
     with h5py.File(sourcePath, 'r') as source, h5py.File(outputPath, 'a') as target:
         for name, value in source.attrs.items():
             target.attrs[name] = value
+        for key in STATIC_KEYS & set(source) & set(target):
+            for name, value in source[key].attrs.items():
+                target[key].attrs[name] = value
         target.attrs['source_file'] = sourcePath.name
         target.attrs['source_epochs'] = f'{epochBegin}-{epochEnd - 1}'
 
