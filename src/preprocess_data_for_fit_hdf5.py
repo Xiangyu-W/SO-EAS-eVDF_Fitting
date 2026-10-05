@@ -565,9 +565,12 @@ def align_rpw_to_eas(rpw_data, eas_epoch, rpw_time_coord='Epoch'):
     rpw_time = rpw_data[rpw_time_coord].values
     rpw_values = rpw_data.values
     
-    # Convert timestamps to numeric (seconds since epoch)
-    rpw_time_numeric = pd.to_datetime(rpw_time).astype('int64') / 1e9
-    eas_time_numeric = pd.to_datetime(eas_epoch_values).astype('int64') / 1e9
+    # Convert timestamps to numeric (seconds since epoch). Both are cast to
+    # nanoseconds first: recent pandas/xarray keep other datetime64 units
+    # (e.g. seconds after resampling), which would put the two axes on
+    # different scales and turn every interpolated value into NaN.
+    rpw_time_numeric = np.asarray(rpw_time).astype('datetime64[ns]').astype('int64') / 1e9
+    eas_time_numeric = np.asarray(eas_epoch_values).astype('datetime64[ns]').astype('int64') / 1e9
     
     # Remove NaN values
     valid_mask = ~np.isnan(rpw_values)
@@ -642,7 +645,7 @@ def get_SO_MAG_SRF_Normal(timeRange):
 
 def average_MAG_around_timeStamp(magArray, EAS_epoch, timeFreq = None):
     # EAS_epoch: Time stamps of the EAS data
-    # timeFreq: time resolution, '1min', '5min', '1H', etc.
+    # timeFreq: time resolution, '1min', '5min', '1h', etc.
 
     # Average MAG data around the time stamp (t-0.5s, t+0.5s)
     if timeFreq is None:
@@ -674,7 +677,7 @@ def average_PAS_around_timeStamp(pasArray, EAS_epoch, timeFreq = None):
     # Average MAG data around the time stamp (t-5s, t+5s)
 
     # EAS_epoch: Time stamps of the EAS data
-    # timeFreq: time resolution, '1min', '5min', '1H', etc.
+    # timeFreq: time resolution, '1min', '5min', '1h', etc.
     if timeFreq is None:
         pasVector = np.array([pasArray.sel(Epoch=slice(t-pd.Timedelta(seconds=5), t+pd.Timedelta(seconds=5))).mean(dim='Epoch').values for t in EAS_epoch])
     else:
@@ -718,7 +721,7 @@ def average_RPWDensity_around_timeStamp(rpwArray, EAS_epoch, timeFreq = None):
     # Average RPW density data around the time stamp (t-0.5s, t+0.5s)
 
     # EAS_epoch: Time stamps of the EAS data
-    # timeFreq: time resolution, '1min', '5min', '1H', etc.
+    # timeFreq: time resolution, '1min', '5min', '1h', etc.
     if timeFreq is None:
         rpwDensity = np.array([rpwArray.sel(Epoch=slice(t-pd.Timedelta(seconds=0.5), t+pd.Timedelta(seconds=0.5))).mean(dim='Epoch').values for t in EAS_epoch])
     else:
@@ -877,7 +880,7 @@ def calc_VparaVperp(vEAS, mag_Vector, vp_Vector):
 def allocateGridIdx(data, gridBin, rightClosed = False):
     return np.digitize(data, gridBin, right=rightClosed) - 1 # np.digitize start from 1. -1 to keep consistency with array index
 
-def create_time_intervals(time_range, freq='6H'):
+def create_time_intervals(time_range, freq='6h'):
     start_time = pd.to_datetime(time_range[0])
     end_time = pd.to_datetime(time_range[1])
     
@@ -886,7 +889,7 @@ def create_time_intervals(time_range, freq='6H'):
     
     # Ensure the last interval covers the end time
     if time_intervals[-1] < end_time:
-        if end_time - time_intervals[-1] < pd.Timedelta('1H'):
+        if end_time - time_intervals[-1] < pd.Timedelta('1h'):
             # Replace the last interval boundary with end_time
             temp_intervals = time_intervals.tolist()
             temp_intervals[-1] = end_time
@@ -1179,7 +1182,7 @@ def process_eas_data(eas1Files, eas2Files, countEAS1_files=None, countEAS2_files
     
     # Create time intervals respecting both 6H frequency and valid regions
     print("Creating time intervals...")
-    time_ranges = create_time_intervals([psdEAS1['EPOCH'].values[0], psdEAS1['EPOCH'].values[-1]], freq='6H')
+    time_ranges = create_time_intervals([psdEAS1['EPOCH'].values[0], psdEAS1['EPOCH'].values[-1]], freq='6h')
     
     if not time_ranges:
         print("No valid time intervals could be created.")
